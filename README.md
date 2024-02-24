@@ -8,7 +8,7 @@ The ReportParser program is designed to extract table data from pdf files and or
 
 ## Installation/Quick Start
 
-1. Copy the `ReportParser` repository
+1. Clone the `ReportParser` github repository
 2. Install dependencies using `requirements.txt`:
    ```
    
