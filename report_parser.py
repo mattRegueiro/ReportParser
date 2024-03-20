@@ -8,13 +8,14 @@
 =========================================================================
 '''
 import sys
+import warnings
 import datetime as dt
 import src.misc as _misc
 import src.globals as _global
 
 from src.pdf import PDFParser
 
-
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 '''
 =========================================================================
