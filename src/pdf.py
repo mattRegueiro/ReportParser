@@ -6,15 +6,20 @@
 * with extracting data from pdf file reports.                           *
 =========================================================================
 '''
+import os
+import re
 import glob
-import tabula
+import threading
 import numpy as np
 import pandas as pd
 import logging as log
 import datetime as dt
+import src.misc as _misc
 import concurrent.futures
+import tabula.io as tabula
 import src.globals as _global
 
+from PyPDF2 import PdfReader
 from collections import defaultdict
 
 
@@ -42,18 +47,20 @@ class PDFParser:
     =========================================================================
     '''
     def __init__(self, pdf_dir: str="", batch_size: int=1) -> None:
-        self._reports_dir           : str           = pdf_dir                   # Initialize pdf report files directory
-        self._batch_size            : int           = batch_size                # Initialize batch size
+        self._reports_dir           : str                       = pdf_dir                   # Initialize pdf report files directory
+        self._batch_size            : int                       = batch_size                # Initialize batch size
 
-        self._logger                : log           = _global.PROG_LOGGER       # Initialize program logger
+        self._logger                : log                       = _global.PROG_LOGGER       # Initialize program logger
+        self._pdf_files             : list[str]                 = self._get_pdf_files()     # Initialize list of pdf files
+        self._runtime_ms            : float                     = 0                         # Initialize pdf parser runtime (ms)
 
-        self._pdf_files             : list[str]     = self._get_pdf_files()     # Initialize list of pdf files
-        self._runtime_ms            : int           = 0                         # Initialize pdf parser runtime (ms)
-        self._pdf_reports_df        : pd.DataFrame  = pd.DataFrame()            # Initialize dataframe of extracted pdf report data
-        self._excel_room_revenue_df : pd.DataFrame  = None                      # Initialize excel dataframe for revenue per room
-        self._excel_room_booking_df : pd.DataFrame  = None                      # Initialize excel dataframe for bookings per room
+        self._pdf_reports           : dict[str, pd.DataFrame]   = {}                        # Initialize dataframe of extracted pdf report data
+        self._excel_room_revenue    : dict[str, pd.DataFrame]   = {}                        # Initialize excel dataframe for revenue per room
+        self._excel_room_booking    : dict[str, pd.DataFrame]   = {}                        # Initialize excel dataframe for bookings per room
 
-        self._exec_complete         : bool          = False                     # Initialize execution complete status flag
+        self._pdf_lock              : threading.Lock            =  threading.Lock()         # Initialize thread lock for extraction of pdf tables
+        self._exec_complete         : bool                      = False                     # Initialize execution complete status flag
+        
         return
 
 
@@ -74,7 +81,7 @@ class PDFParser:
     =========================================================================
     '''
     def _get_pdf_files(self) -> list[str]:
-        return glob.glob(self._reports_dir + '/*.pdf')          # Get all pdf reports in /reports directory
+        return glob.glob(self._reports_dir + '/*.pdf')      # Get all pdf reports in /reports directory
 
 
 
@@ -93,7 +100,7 @@ class PDFParser:
     =========================================================================
     '''
     def _has_pdf_files(self) -> bool:
-        return True if self._pdf_files else False               # Return True if pdf reports found, else False
+        return True if self._pdf_files else False           # Return True if pdf reports found, else False
 
 
 
@@ -140,6 +147,7 @@ class PDFParser:
             table[table.columns[column_idx]] = table[table.columns[column_idx]].str.replace(",","")
 
         table[table.columns[column_idx]] = table[table.columns[column_idx]].fillna(-1).astype(data_type)
+        
         return
 
 
@@ -165,44 +173,39 @@ class PDFParser:
 
         # Use threads to process batches of pdf report files
         with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = []
 
             # Iterate over pdf report file batches
             for i in range(0, len(self._pdf_files), self._batch_size):
 
-                self._logger.info(f"Processing pdf report file batch #{batch_n}...")
+                self._logger.info(f"Processing pdf report file batch #{batch_n}... please wait.")
 
                 # Process each batch of pdf report files
                 batch_files = self._pdf_files[i:i+self._batch_size]
-                futures = [executor.submit(self._process_batch, batch_n, batch_files)]
+                futures.append(executor.submit(self._process_batch, batch_n, batch_files))
 
-                # Add completed batches to result list
-                for future in concurrent.futures.as_completed(futures):
-                    n, result_dict = future.result()
-                    self._logger.info(f"Finished processing pdf report file batch #{n}")
-                    batch_results.append(result_dict)
+                batch_n += 1
+
+            # Add completed batches to result list
+            for future in concurrent.futures.as_completed(futures):
+                n, elapsed_time, result_dict = future.result()
+                self._logger.info(f"Finished processing pdf report file batch #{n} in {elapsed_time:.2f} ms ({elapsed_time/1000:.2f} sec.)")
+                batch_results.append(result_dict)
 
         # If batch results list is empty
         if not batch_results:
             self._logger.error("No batch results generated !!!")
             return
 
-        parsed_dict_combined = batch_results[0]             # Set the first parsed data dictionary as the base dictionary
+        # Combine batch results
+        self._combine_results(batch_results)
 
-        # Iterate over the remaining batch dictionaries
-        for i in range(1, len(batch_results)):
-
-            # Iterate over each batch dictionary key/value pair
-            for key, value in batch_results[i].items():
-                parsed_dict_combined[key].extend(value)     # Add batch dictionary data to base dictionary
-        
-
-        # Convert batch dictionary to dataframe
-        self._pdf_reports_df = pd.DataFrame(parsed_dict_combined)
         self._exec_complete = True
 
-        # Stop batch processing timer
+        # Stop batch processing timer (ms)
         self._runtime_ms = (dt.datetime.now() - start_time).total_seconds() * 1000
-        self._logger.info(f"Processed {len(self._pdf_files)} pdf reports in {self._runtime_ms:.2f} ms")
+        self._logger.info(f"Processed {len(self._pdf_files)} pdf reports in {self._runtime_ms:.2f} ms ({self._runtime_ms/1000:.2f} sec.)")
+        
         return 
 
 
@@ -220,19 +223,35 @@ class PDFParser:
     *                              in a single batch.                       *
     *                                                                       *
     *   OUPUT:                                                              *
-    *           tuple[int, dict] - A tuple containing the batch number and  *
-    *                              a dictionary containing the combined     *
-    *                              parsed data from the current batch.      *
+    *      tuple[int, int, dict] - A tuple containing the batch number, the *
+    *                              elapsed time and a dictionary containing *
+    *                              the combined parsed data from the        *
+    *                              current batch.                           *
     =========================================================================
     '''
-    def _process_batch(self, batch_number: int, batch_files: list[str]) -> tuple[int, defaultdict(list)]:
-        parsed_dict_batch = defaultdict(list)                   # Initialize batch dictionary of parsed data
+    def _process_batch(self, batch_number: int, batch_files: list[str]) -> tuple[int, int, defaultdict]:
+        start_time = dt.datetime.now()      # Initialize batch processing start timer
+
+        # Initialize batch dictionary of parsed data {year: month: room: room data}
+        parsed_dict_batch = defaultdict(
+                                lambda: defaultdict( 
+                                    lambda: defaultdict(
+                                        lambda: defaultdict(
+                                            float
+                                        )
+                                    )
+                                )
+                            )
 
         # Iterate over each pdf file in our batch
         for file in batch_files:
+            
+            # Get the year the report was generated for
+            year = self._get_report_year(file)
 
             # Read all pages of pdf file and extract all table information
-            df_list = tabula.read_pdf(file, pages="all", lattice=False)
+            with self._pdf_lock:
+                df_list = tabula.read_pdf(file, pages="all", lattice=False)
 
             # Iterate over each table from each pdf page
             for page, pdf_df in enumerate(df_list):
@@ -242,13 +261,18 @@ class PDFParser:
                     self._logger.warning(f"'{file}' - PDF page #{page} dataframe is empty")                    
                     continue
 
+                # Find and remove all "Unnamed" columns
+                unnamed_columns = [col for col in pdf_df.columns if col.startswith("Unnamed")]
+                if unnamed_columns:
+                    pdf_df.drop(columns=unnamed_columns, inplace=True)
+
                 col_idx = 0                                                                         # Initialize pdf dataframe column index
                 row_start = pdf_df[pdf_df.columns[col_idx]].first_valid_index()                     # Set the index of the first sub-row in a pdf file table row
-                row_end = len(pdf_df)-1                                                             # Set the index of the last sub-row in a pdf file table row
+                row_end = pdf_df[pdf_df.columns[col_idx]].drop(row_start).first_valid_index()       # Update index of last sub-row
 
-                # If we are not at the last page of pdf report file
-                if page < len(df_list)-1:
-                    row_end = pdf_df[pdf_df.columns[col_idx]].drop(row_start).first_valid_index()   # Update index of last sub-row
+                # If last sub-row index not found
+                if not row_end:
+                    row_end = len(pdf_df)-1                                                         # Set the index of the last sub-row to the length of the pdf dataframe
                 
                 # Calculate the number of sub-rows in a pdf file table row
                 n_sub_rows = row_end - row_start
@@ -263,68 +287,126 @@ class PDFParser:
                     # Get current row's room number
                     self._update_column_datatype(col_idx, "int32", pdf_df)
                     room_number = pdf_df[pdf_df.columns[col_idx]][row_idx]
-                    parsed_dict_batch[pdf_df.columns[col_idx]].append(room_number)                  # Add room number to parsed data dictionary
-                    col_idx = (col_idx + 1) % len(pdf_df.columns)                                   # Increment pdf dataframe column index
+                    col_idx = (col_idx + 1) % len(pdf_df.columns)
 
                     # Get list of current row's months
                     self._update_column_datatype(col_idx, "object", pdf_df)
                     months = pdf_df[pdf_df.columns[col_idx]][row_idx+1:row_idx+n_sub_rows-1]
-                    parsed_dict_batch[pdf_df.columns[col_idx]].append(months.values)                # Add list of months to parsed data dictionary
-                    col_idx = (col_idx + 1) % len(pdf_df.columns)                                   # Increment pdf dataframe column index
+                    col_idx = (col_idx + 1) % len(pdf_df.columns)
 
                     # Get list of number of arrivals for each month of current row's room number
                     self._update_column_datatype(col_idx, "int32", pdf_df)
                     n_arrivals = pdf_df[pdf_df.columns[col_idx]][row_idx+1:row_idx+n_sub_rows-1]
-                    parsed_dict_batch[pdf_df.columns[col_idx]].append(n_arrivals.values)            # Add number of arrivals to parsed data dictionary
-
-                    # Get total number of arrivals for each month of current row's room number
-                    try:
-                        total_arrivals = pdf_df[pdf_df.columns[col_idx]][row_idx+n_sub_rows-1]
-                    except KeyError:
-                        total_arrivals = sum(n_arrivals)
-                    parsed_dict_batch[f"Total {pdf_df.columns[col_idx]}"].append(total_arrivals)    # Add total number of arrivals to parsed data dictionary
-                    col_idx = (col_idx + 1) % len(pdf_df.columns)                                   # Increment pdf dataframe column index
+                    col_idx = (col_idx + 1) % len(pdf_df.columns)
 
                     # Get list of number of nights for each month of current row's room number
                     self._update_column_datatype(col_idx, "int32", pdf_df)
                     n_nights = pdf_df[pdf_df.columns[col_idx]][row_idx+1:row_idx+n_sub_rows-1]
-                    parsed_dict_batch[pdf_df.columns[col_idx]].append(n_nights.values)              # Add number of nights to parsed data dictionary
-
-                    # Get total number of nights for each month of current row's room number
-                    try:
-                        total_nights = pdf_df[pdf_df.columns[col_idx]][row_idx+n_sub_rows-1]
-                    except KeyError:
-                        total_nights = sum(n_nights)
-                    parsed_dict_batch[f"Total {pdf_df.columns[col_idx]}"].append(total_nights)      # Add total number of nights to parsed data dictionary
-                    col_idx = (col_idx + 1) % len(pdf_df.columns)                                   # Increment pdf dataframe column index
+                    col_idx = (col_idx + 1) % len(pdf_df.columns)
 
                     # Get list of room revenue for each month of current row's room number
                     self._update_column_datatype(col_idx, "float32", pdf_df)
                     room_revenue = pdf_df[pdf_df.columns[col_idx]][row_idx+1:row_idx+n_sub_rows-1]
-                    parsed_dict_batch[pdf_df.columns[col_idx]].append(room_revenue.values)          # Add room revenue to parsed data dictionary
-
-                    # Get total revenue of current row's room number
-                    try:
-                        total_revenue = pdf_df[pdf_df.columns[col_idx]][row_idx+n_sub_rows-1]
-                    except KeyError:
-                        total_revenue = sum(room_revenue)
-                    parsed_dict_batch[f"Total {pdf_df.columns[col_idx]}"].append(total_revenue)     # Add total room revenue to parsed data dictionary
-                    col_idx = (col_idx + 1) % len(pdf_df.columns)                                   # Increment pdf dataframe column index
+                    col_idx = (col_idx + 1) % len(pdf_df.columns)
 
                     # Get list of room ADR for each month of current row's room number
                     self._update_column_datatype(col_idx, "float32", pdf_df)
                     room_adr = pdf_df[pdf_df.columns[col_idx]][row_idx+1:row_idx+n_sub_rows-1]
-                    parsed_dict_batch[pdf_df.columns[col_idx]].append(room_adr.values)              # Add room ADR to parsed data dictionary
+                    col_idx = (col_idx + 1) % len(pdf_df.columns)
 
-                    # Get total ADR of current row's room number
-                    try:
-                        total_adr = pdf_df[pdf_df.columns[col_idx]][row_idx+n_sub_rows-1]
-                    except KeyError:
-                        total_adr = sum(room_adr)
-                    parsed_dict_batch[f"Total {pdf_df.columns[col_idx]}"].append(total_adr)         # Add total room ADR to parsed data dictionary
-                    col_idx = (col_idx + 1) % len(pdf_df.columns)                                   # Increment pdf dataframe column index
+                    # Iterate over each month for current room number
+                    for i, month in enumerate(months.values):
+                        # Skip over "Room No." and "Month" columns
+                        col_idx = (col_idx + 2) % len(pdf_df.columns)
 
-        return (batch_number, parsed_dict_batch)
+                        # Get number of room arrivals for current year/month/room number
+                        parsed_dict_batch[year][month][room_number][pdf_df.columns[col_idx]] = n_arrivals.values[i]
+                        col_idx = (col_idx + 1) % len(pdf_df.columns)
+
+                        # Get number of room nights for current year/month/room number
+                        parsed_dict_batch[year][month][room_number][pdf_df.columns[col_idx]] = n_nights.values[i]
+                        col_idx = (col_idx + 1) % len(pdf_df.columns)
+
+                        # Get room revenue for current year/month/room number
+                        parsed_dict_batch[year][month][room_number][pdf_df.columns[col_idx]] = room_revenue.values[i]
+                        col_idx = (col_idx + 1) % len(pdf_df.columns)
+
+                        # Get room ADR for current year/month/room number
+                        parsed_dict_batch[year][month][room_number][pdf_df.columns[col_idx]] = room_adr.values[i]
+                        col_idx = (col_idx + 1) % len(pdf_df.columns)
+
+        # Calculated elapsed time to complete batch (ms)
+        elapsed_time = (dt.datetime.now() - start_time).total_seconds() * 1000
+
+        return (batch_number, elapsed_time, parsed_dict_batch)
+
+
+
+    '''
+    =========================================================================
+    * _get_report_year()                                                    *
+    =========================================================================
+    * This function will find and return the year the pdf report was        *
+    * generated for.                                                        *
+    *                                                                       *
+    *   INPUT:                                                              *
+    *         file (str) - The pdf report file.                             *
+    *                                                                       *
+    *   OUPUT:                                                              *
+    *         year (str) - The pdf report year or the current year if the   *
+    *                      pdf report year was not found.                   *
+    =========================================================================
+    '''
+    def _get_report_year(self, file: str) -> str:
+        reader = PdfReader(file)        # Initialize pdf reader
+        first_page = reader.pages[0]    # Extract the text from the first page of the pdf report
+
+        # Find and extract the filter year the report was generated for
+        year_str = first_page.extract_text().split("\n")[2]
+        match = re.search(r'\b\d{4}\b', year_str)
+
+        return match.group() if match else dt.date.today().strftime("%Y")
+
+
+
+    '''
+    =========================================================================
+    * _combine_results()                                                    *
+    =========================================================================
+    * This function will take a list of batch processing results and        *
+    * combine them into a dataframe table. Each year processed will have    *
+    * its own dataframe table.                                              *
+    *                                                                       *
+    *   INPUT:                                                              *
+    *         batch_results (list) - List of batch processing results.      *
+    *                                                                       *
+    *   OUPUT:                                                              *
+    *         None                                                          *
+    =========================================================================
+    '''
+    def _combine_results(self, batch_results: list) -> None:
+        # Iterate over each batch dictionary in batch results list
+        for batch_dict in batch_results:
+
+            # Iterate over each year / month dictionary pair
+            for year, month_dict in batch_dict.items():
+
+                # Iterate over each month / room dictionary pair
+                for month, room_dict in month_dict.items():
+                    _df = pd.DataFrame.from_dict(room_dict, orient="index") # Convert room dictionary for current year to dataframe
+                    _df["Month"] = [month] * len(_df.index)                 # Add current month to dataframe
+                    _df = _df.applymap(lambda x: [x])                       # Convert each column's values to lists
+                    
+                    # If current year does not exist in pdf reports dataframe
+                    if year not in self._pdf_reports:
+                        self._pdf_reports[year] = _df                       # Add dataframe to pdf reports dataframe
+                        continue
+
+                    # Concatenate pdf reports dataframe and new dataframe (group by index and aggregate values into lists)
+                    concat_df = pd.concat([self._pdf_reports[year], _df])
+                    self._pdf_reports[year] = concat_df.groupby(level=0).agg(lambda x: list(np.concatenate(x.tolist())))
+
+        return
 
 
 
@@ -343,41 +425,30 @@ class PDFParser:
     =========================================================================
     '''
     def _build_excel_tables(self) -> None:
-        room_numbers = []       # Initialize list of room numbers
+        # Iterate over each yearly dataframe
+        for year, _df in self._pdf_reports.items():
 
-        # Generate room numbers for each range
-        for start, end in _global.PROPERTY_ROOMS:
-            if end == -1:
-                room_numbers.append(start)
-            else:
-                room_numbers.extend(range(start, end + 1))
+            # Create excel dataframes for revenue and bookings per room for current year
+            self._excel_room_revenue[year] = pd.DataFrame(index=_df.index)
+            self._excel_room_booking[year] = pd.DataFrame(index=_df.index)
 
-        # Create excel dataframes for revenue and bookings per room
-        self._excel_room_revenue_df = pd.DataFrame(index=room_numbers, columns=_global.MONTH_NAMES).astype("float32")
-        self._excel_room_booking_df = pd.DataFrame(index=room_numbers, columns=_global.MONTH_NAMES).fillna(0).astype("int32")
+            # Iterate over each row in dataframe
+            for room, row in _df.iterrows():
 
-        # Iterate over room numbers
-        for room in room_numbers:
-            # Get current room data table
-            room_df = self._pdf_reports_df[self._pdf_reports_df[self._pdf_reports_df.columns.values[0]] == room]
+                # Iterate over each month in dataframe "Month" column
+                for i, month in enumerate(row["Month"]):
 
-            # Iterate over room data table rows
-            for _, row in room_df.iterrows():
+                    # Add revenue and nightly stay for each room corresponding to the current month
+                    self._excel_room_revenue[year].at[room, month] = row["Room Revenue"][i]
+                    self._excel_room_booking[year].at[room, month] = row["Room Nights"][i]
 
-                # Iterate over room months
-                room_months = [month for month in row["Month"]]
-                for i, month in enumerate(room_months):
-                    # Set room revenue and bookings per month
-                    self._excel_room_revenue_df.at[row["Room No."], month] = row["Room Revenue"][i]
-                    self._excel_room_booking_df.at[row["Room No."], month] = row["Room Nights"][i]
+            # Reindex the month columns to be in the correct order and calculate the yearly total revenue
+            self._excel_room_revenue[year]["Yearly Total"] = self._excel_room_revenue[year].sum(axis=1, skipna=True)
+            self._excel_room_revenue[year] = self._excel_room_revenue[year].reindex(_global.MONTH_NAMES + ["Yearly Total"], axis=1).fillna(0).astype("float32")
 
-        # Calculate the yearly total revenue
-        self._excel_room_revenue_df["Yearly Total"] = self._excel_room_revenue_df.sum(axis=1, skipna=True)
-        self._excel_room_revenue_df["Yearly Total"] = self._excel_room_revenue_df["Yearly Total"].astype("float32")
-
-        # Calculate the yearly total bookings
-        self._excel_room_booking_df["Yearly Total"] = self._excel_room_booking_df.sum(axis=1, skipna=True)
-        self._excel_room_booking_df["Yearly Total"] = self._excel_room_booking_df["Yearly Total"].fillna(0).astype("int32")
+            # Reindex the month columns to be in the correct order and calculate the yearly total bookings
+            self._excel_room_booking[year]["Yearly Total"] = self._excel_room_booking[year].sum(axis=1, skipna=True)
+            self._excel_room_booking[year] = self._excel_room_booking[year].reindex(_global.MONTH_NAMES + ["Yearly Total"], axis=1).fillna(0).astype("int32")
 
         return
 
@@ -398,9 +469,10 @@ class PDFParser:
     =========================================================================
     '''
     def _output_tables(self) -> None:
-        self._output_df_table(name="pdfData", table=self._pdf_reports_df)               # Output pdf report data to excel file
-        self._output_df_table(name="roomRevenue", table=self._excel_room_revenue_df)    # Output room revenue data to excel file
-        self._output_df_table(name="roomBooking", table=self._excel_room_booking_df)    # Output room booking data to excel file
+        self._output_df_table(name="pdfData", table=self._pdf_reports)               # Output pdf report data to excel file
+        self._output_df_table(name="roomRevenue", table=self._excel_room_revenue)    # Output room revenue data to excel file
+        self._output_df_table(name="roomBooking", table=self._excel_room_booking)    # Output room booking data to excel file
+        
         return
 
 
@@ -413,41 +485,64 @@ class PDFParser:
     * to the /output directory.                                             *
     *                                                                       *
     *   INPUT:                                                              *
-    *                name (str) - The name of the excel file.               *
-    *         table (DataFrame) - The dataframe to write to excel file.     *
+    *           name (str) - The name of the excel file.                    *
+    *         table (dict) - The dictionary containing the dataframe(s) to  *
+    *                        write to excel file.                           *
     *                                                                       *
     *   OUPUT:                                                              *
     *         None                                                          *
     =========================================================================
     '''
-    def _output_df_table(self, name: str, table: pd.DataFrame) -> None:
-        datetime_str = dt.datetime.today().strftime("%m_%d_%y_%H_%M_%S")        # Initialize datetime string
-        output_file_path = f"{_global.OUTPUT_DIR}/{name}_{datetime_str}.xlsx"   # Set output file path for pdf data table 
+    def _output_df_table(self, name: str, table: dict[str, pd.DataFrame]) -> None:
+        # Iterate over each yearly dataframe for current table
+        for year, _df in table.items():
 
-        # Write the DataFrame to Excel with accounting formatting
-        excel_writer = pd.ExcelWriter(output_file_path, engine='xlsxwriter')
-        table.to_excel(excel_writer, sheet_name=name)
+            _misc.mkdir(f"{_global.OUTPUT_DIR}/{year}")                             # Make output directory for current year
+            excel_file_path = f"{_global.OUTPUT_DIR}/{year}/{name}.xlsx"            # Set excel output file path for pdf data table 
 
-        workbook = excel_writer.book                                            # Get the excel workbook 
-        worksheet = excel_writer.sheets[name]                                   # Get the excel worksheet
+            # If excel data file already exists AND output table is revenue or booking
+            if os.path.exists(excel_file_path) and name != "pdfData":
+                excel_df = pd.read_excel(excel_file_path, index_col=0)              # Read the excel file and store it into a dataframe
+                excel_df = excel_df.astype(excel_df.dtypes.value_counts().idxmax()) # Set the excel dataframe datatype
+                columns_to_add = _df.columns[(_df != excel_df).any()]               # Find columns to add to excel dataframe
 
-        # Apply accounting format to desired columns
-        for col_num, col_name in enumerate(table.columns):
-            col_format = workbook.add_format()                                  # Add formatting for excel column
-            col_format.set_num_format(0)                                        # Initialize excel column formatting to generic
+                # Iterate over all missing columns (exclude last column ("Yearly Total"))
+                for i in range(len(columns_to_add)-1):
+                    
+                    # If column does not contain all zero data
+                    if (excel_df[columns_to_add[i]] != 0).any():
+                        continue                                                    # Skip over column
 
-            # If column datatype is floating point
-            if np.issubdtype(table[col_name].dtype, np.floating):
-                col_format.set_num_format(44)                                   # Set excel formatting to accounting
+                    excel_df[columns_to_add[i]] = _df[columns_to_add[i]]            # Replace excel dataframe column values
+                
+                # Calculate new yearly total
+                excel_df["Yearly Total"] = excel_df.iloc[:, :-1].sum(axis=1, skipna=True)
+                _df = excel_df
 
-            # Else if column datatype is 
-            elif np.issubdtype(table[col_name].dtype, np.integer):
-                col_format.set_num_format(1)                                    # Set excel formatting to numeric
+            # Write the DataFrame to Excel with accounting formatting
+            excel_writer = pd.ExcelWriter(excel_file_path, engine='xlsxwriter')
+            _df.to_excel(excel_writer, sheet_name=name)
+
+            workbook = excel_writer.book                                            # Get the excel workbook 
+            worksheet = excel_writer.sheets[name]                                   # Get the excel worksheet
+
+            # Apply accounting format to desired columns
+            for col_num, col_name in enumerate(_df.columns):
+                col_format = workbook.add_format()                                  # Add formatting for excel column
+                col_format.set_num_format(0)                                        # Initialize excel column formatting to generic
+
+                # If column datatype is floating point
+                if np.issubdtype(_df[col_name].dtype, np.floating):
+                    col_format.set_num_format(44)                                   # Set excel formatting to accounting
+
+                # Else if column datatype is 
+                elif np.issubdtype(_df[col_name].dtype, np.integer):
+                    col_format.set_num_format(1)                                    # Set excel formatting to numeric
+                
+                col_width = max(_df[col_name].astype(str).map(len).max(), len(col_name))
+                worksheet.set_column(col_num + 1, col_num + 1, col_width + 5, col_format)
             
-            col_width = max(table[col_name].astype(str).map(len).max(), len(col_name))
-            worksheet.set_column(col_num+1, col_num+1, col_width + 5, col_format)
-        
-        # Save the Excel file
-        excel_writer.close()
+            # Save the excel file
+            excel_writer.close()
 
         return
